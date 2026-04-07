@@ -2,21 +2,25 @@ package goflow
 
 import "sync"
 
-// pool is a goroutine pool with an unbounded FIFO task queue.
-// Workers are created on demand up to the concurrency cap and exit when the queue is empty.
-// FIFO ordering ensures priority-sorted tasks are dequeued in priority order.
+// pool is a bounded goroutine pool with an unbounded FIFO task queue.
+//
+// Design properties:
+//   - Go() never blocks the caller, preventing deadlocks when tasks submit sub-tasks
+//   - Workers are created on demand (up to cap) and exit when the queue drains
+//   - FIFO ordering preserves the priority sort done by the scheduler
 type pool struct {
 	mu      sync.Mutex
 	queue   []func()
-	workers uint
-	cap     uint
+	workers uint // currently active worker goroutines
+	cap     uint // maximum concurrent workers
 }
 
 func newPool(concurrency uint) *pool {
 	return &pool{cap: concurrency}
 }
 
-// Go enqueues f for execution. Never blocks the caller.
+// Go enqueues f for execution. If workers < cap, a new worker goroutine is spawned.
+// The caller is never blocked, even if all workers are busy.
 func (p *pool) Go(f func()) {
 	p.mu.Lock()
 	p.queue = append(p.queue, f)
@@ -29,6 +33,8 @@ func (p *pool) Go(f func()) {
 	}
 }
 
+// run is the worker loop. It dequeues and executes tasks until the queue is empty,
+// then decrements the worker count and exits.
 func (p *pool) run() {
 	for {
 		p.mu.Lock()
@@ -38,7 +44,7 @@ func (p *pool) run() {
 			return
 		}
 		f := p.queue[0]
-		p.queue[0] = nil // avoid retaining references
+		p.queue[0] = nil // avoid retaining closure references
 		p.queue = p.queue[1:]
 		p.mu.Unlock()
 		f()

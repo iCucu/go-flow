@@ -11,16 +11,19 @@ import (
 
 // Executor schedules and executes a TaskFlow.
 type Executor interface {
+	// Run freezes the TaskFlow and begins asynchronous execution.
 	Run(tf *TaskFlow) Executor
+	// Wait blocks until all tasks (including subflows) have completed.
 	Wait()
 }
 
 type executor struct {
 	pool *pool
-	wg   sync.WaitGroup
+	wg   sync.WaitGroup // tracks all tasks across all graphs
 }
 
 // NewExecutor creates an Executor with the given concurrency limit.
+// Concurrency controls the maximum number of goroutines executing tasks simultaneously.
 func NewExecutor(concurrency uint) Executor {
 	if concurrency == 0 {
 		panic("executor concurrency cannot be zero")
@@ -30,16 +33,21 @@ func NewExecutor(concurrency uint) Executor {
 	}
 }
 
+// Run freezes the TaskFlow (preventing further task additions) and begins execution.
 func (e *executor) Run(tf *TaskFlow) Executor {
 	tf.frozen = true
 	e.scheduleGraph(nil, tf.graph)
 	return e
 }
 
+// Wait blocks until every scheduled task has finished.
 func (e *executor) Wait() {
 	e.wg.Wait()
 }
 
+// scheduleGraph sets up a graph, dispatches its entry nodes, and blocks until
+// all nodes in the graph complete. If the graph is canceled (due to a panic),
+// the cancellation propagates to the parent graph.
 func (e *executor) scheduleGraph(parent *graph, g *graph) {
 	g.setup()
 	sortByPriority(g.entries)
@@ -55,6 +63,8 @@ func (e *executor) scheduleGraph(parent *graph, g *graph) {
 	}
 }
 
+// schedule submits a single node for execution via the worker pool.
+// Skipped if the owning graph has been canceled.
 func (e *executor) schedule(n *node) {
 	if n.g.canceled.Load() {
 		return
@@ -64,6 +74,7 @@ func (e *executor) schedule(n *node) {
 	e.pool.Go(func() { e.invokeNode(n) })
 }
 
+// invokeNode dispatches to the appropriate handler based on node type.
 func (e *executor) invokeNode(n *node) {
 	switch p := n.ptr.(type) {
 	case *staticData:
@@ -77,6 +88,7 @@ func (e *executor) invokeNode(n *node) {
 	}
 }
 
+// invokeStatic executes an Operator node (static task or user-defined Operator).
 func (e *executor) invokeStatic(n *node, p *staticData) {
 	defer e.staticFinished(n)
 
@@ -88,6 +100,8 @@ func (e *executor) invokeStatic(n *node, p *staticData) {
 	n.state.Store(int32(nodeFinished))
 }
 
+// invokeSubflow creates a fresh sub-graph, invokes the user callback to populate it,
+// then recursively schedules and waits for the sub-graph to complete.
 func (e *executor) invokeSubflow(n *node, p *subflowData) {
 	defer e.staticFinished(n)
 
@@ -99,7 +113,7 @@ func (e *executor) invokeSubflow(n *node, p *subflowData) {
 	sg := newGraph(n.name)
 	sf := &Subflow{g: sg}
 	e.safeCall(n, func() { p.handle(sf) })
-	p.lastGraph = sg
+	p.lastGraph = sg // retained for DOT visualization
 
 	if !n.g.canceled.Load() {
 		e.scheduleGraph(n.g, sg)
@@ -108,6 +122,9 @@ func (e *executor) invokeSubflow(n *node, p *subflowData) {
 	n.state.Store(int32(nodeFinished))
 }
 
+// invokeCondition runs the predicate and schedules the chosen successor.
+// The node is rearmed BEFORE scheduling the successor to avoid a race:
+// the successor's drop() must see a valid joinCounter on this node.
 func (e *executor) invokeCondition(n *node, p *conditionData) {
 	defer e.conditionFinished(n)
 
@@ -127,14 +144,13 @@ func (e *executor) invokeCondition(n *node, p *conditionData) {
 		panic(fmt.Sprintf("condition %q returned %d but only %d successors mapped", n.name, choice, len(p.mapper)))
 	}
 
-	// Re-arm self BEFORE scheduling successor so that the successor's
-	// drop() sees a valid joinCounter when decrementing this node.
 	n.rearm()
 	n.state.Store(int32(nodeIdle))
 	e.schedule(target)
 }
 
-// staticFinished is the defer handler for static and subflow nodes.
+// staticFinished is the deferred cleanup for static and subflow nodes.
+// Order matters: drop -> schedule successors -> rearm -> reset state -> wg.Done.
 func (e *executor) staticFinished(n *node) {
 	n.drop()
 	e.scheduleSuccessors(n)
@@ -144,19 +160,19 @@ func (e *executor) staticFinished(n *node) {
 	e.wg.Done()
 }
 
-// conditionFinished is the defer handler for condition nodes.
+// conditionFinished is the deferred cleanup for condition nodes.
+// Rearm and state reset are done in invokeCondition before scheduling the successor.
 func (e *executor) conditionFinished(n *node) {
-	// Re-arm and state reset already done before schedule in invokeCondition,
-	// or done here if the condition was canceled / panicked.
 	n.g.wg.Done()
 	e.wg.Done()
 }
 
+// scheduleSuccessors checks each successor and schedules those whose dependencies
+// are all satisfied. CAS on state prevents double-scheduling when multiple
+// predecessors complete concurrently.
 func (e *executor) scheduleSuccessors(n *node) {
 	candidates := make([]*node, 0, len(n.successors))
 	for _, succ := range n.successors {
-		// Use CAS to atomically claim the right to schedule this successor.
-		// This prevents double-scheduling when multiple predecessors finish concurrently.
 		if succ.recyclable() && succ.state.CompareAndSwap(int32(nodeIdle), int32(nodeWaiting)) {
 			candidates = append(candidates, succ)
 		}
@@ -167,6 +183,7 @@ func (e *executor) scheduleSuccessors(n *node) {
 	}
 }
 
+// safeCall executes f and recovers from any panic, marking the graph as canceled.
 func (e *executor) safeCall(n *node, f func()) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -178,6 +195,8 @@ func (e *executor) safeCall(n *node, f func()) {
 	f()
 }
 
+// safeCallCondition is like safeCall but returns the predicate's uint result.
+// On panic, returns 0 (the caller checks canceled before using the result).
 func (e *executor) safeCallCondition(n *node, f func() uint) uint {
 	var result uint
 	func() {
@@ -193,6 +212,7 @@ func (e *executor) safeCallCondition(n *node, f func() uint) uint {
 	return result
 }
 
+// sortByPriority sorts nodes by priority (lower value = higher priority).
 func sortByPriority(nodes []*node) {
 	if len(nodes) <= 1 {
 		return

@@ -5,11 +5,14 @@ import (
 	"sync/atomic"
 )
 
+// graph is the internal DAG container. It holds all nodes, identifies entry points
+// (nodes with no predecessors), and tracks graph-level completion via sync.WaitGroup.
+// A single graph may represent a top-level TaskFlow or a dynamically created subflow.
 type graph struct {
 	name     string
 	nodes    []*node
-	entries  []*node
-	canceled atomic.Bool
+	entries  []*node      // populated by setup(); nodes with len(dependents) == 0
+	canceled atomic.Bool  // set to true when any task in this graph panics
 	wg       sync.WaitGroup
 }
 
@@ -21,11 +24,15 @@ func newGraph(name string) *graph {
 	}
 }
 
+// push adds a node to this graph and binds the node's graph pointer.
 func (g *graph) push(n *node) {
 	g.nodes = append(g.nodes, n)
 	n.g = g
 }
 
+// setup prepares the graph for execution: resets all joinCounters,
+// re-computes dependency counts, and identifies entry nodes.
+// Must be called before scheduling.
 func (g *graph) setup() {
 	g.entries = g.entries[:0]
 	for _, n := range g.nodes {
@@ -39,6 +46,8 @@ func (g *graph) setup() {
 	}
 }
 
+// walk visits every node in the graph, recursing into instantiated subflows.
+// Used by the DOT visualizer.
 func (g *graph) walk(fn func(*node)) {
 	for _, n := range g.nodes {
 		fn(n)
