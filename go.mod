@@ -1,4 +1,4 @@
-module github.com/zhiyidu/go-flow
+module github.com/iCucu/go-flow
 
 go 1.24.4
 

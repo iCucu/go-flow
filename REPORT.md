@@ -160,7 +160,7 @@ go test -v -race -count=1 ./...
 ```
 goos: darwin
 goarch: arm64
-pkg: github.com/zhiyidu/go-flow
+pkg: github.com/iCucu/go-flow
 cpu: Apple M4 Pro
 
 BenchmarkGoFlow_C32-14                           74852     14994 ns/op     1663 B/op      84 allocs/op
